@@ -1,0 +1,679 @@
+/*
+  ====================================================================
+  لعبة "Defuse the Bomb" - نزع فتيل القنبلة
+  تعمل على Arduino Uno
+  ====================================================================
+  المكونات:
+    - شاشة LCD 16x2 عبر I2C (العنوان 0x27)
+    - Joystick (المحور X على A0, المحور Y على A1, الزر SW على D7)
+    - LED أخضر على D5
+    - LED أحمر على D6
+    - Buzzer (Active) على D8
+    - زر البداية Start Button على D11 (INPUT_PULLUP)
+
+  فكرة اللعبة:
+    يولد البرنامج رمزاً سرياً من 4 أرقام، وعلى اللاعب تخمينه خلال
+    30 ثانية وبعدد محاولات محدود (5 محاولات) باستخدام الجويستيك.
+  ====================================================================
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ------------------- إعداد شاشة LCD -------------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ------------------- تعريف المنافذ (Pins) -------------------
+const uint8_t PIN_JOY_VRX   = A0;  // محور X في الجويستيك (يمين / يسار)
+const uint8_t PIN_JOY_VRY   = A1;  // محور Y في الجويستيك (فوق / تحت)
+const uint8_t PIN_JOY_SW    = 7;   // زر الجويستيك (تأكيد الرمز)
+const uint8_t PIN_LED_GREEN = 5;   // LED الأخضر (نجاح)
+const uint8_t PIN_LED_RED   = 6;   // LED الأحمر (فشل)
+const uint8_t PIN_BUZZER    = 8;   // البازر (Active Buzzer)
+const uint8_t PIN_START_BTN = 11;  // زر بدء اللعبة
+
+const unsigned int BUZZER_FREQ = 2000; // تردد صوت البازر بالهرتز (صوت واضح وقوي)
+
+// ------------------- ثوابت اللعبة -------------------
+const uint8_t  CODE_LENGTH     = 4;      // عدد أرقام الرمز السري
+const uint8_t  MAX_ATTEMPTS    = 5;      // عدد المحاولات المسموحة
+unsigned long GAME_DURATION = 30000UL;   // مدة اللعبة الحالية (تُحسب حسب الصعوبة والمستوى)
+
+// عتبات حركة الجويستيك (القيمة المتوسطة تقريباً 512)
+const int JOY_CENTER     = 512;
+const int JOY_THRESHOLD  = 200;   // هامش الحركة قبل اعتبارها ضغطة فعلية
+
+// ------------------- نظام الصعوبة والمستويات -------------------
+const uint8_t DIFFICULTY_COUNT = 3; // Easy, Normal, Hard
+const char* const DIFFICULTY_NAMES[DIFFICULTY_COUNT] = {"Easy", "Normal", "Hard"};
+
+const uint8_t LEVEL_COUNT = 5; // عدد المستويات المعرّفة لكل صعوبة
+
+// وقت كل مستوى (بالثواني) لكل صعوبة - المستوى 5 هو أقل وقت ولا ينخفض بعده
+const unsigned long DIFFICULTY_LEVEL_SECONDS[DIFFICULTY_COUNT][LEVEL_COUNT] = {
+  {120, 90, 60, 45, 30}, // Easy
+  {60,  45, 30, 20, 15}, // Normal
+  {30,  20, 15, 10, 5}   // Hard
+};
+
+const uint8_t WINS_TO_LEVEL_UP = 5; // عدد الانتصارات المتتالية اللازمة لرفع المستوى
+
+uint8_t difficultyIndex = 0;                 // الصعوبة المختارة حالياً (0=Easy,1=Normal,2=Hard)
+uint8_t levelByDifficulty[DIFFICULTY_COUNT]      = {1, 1, 1}; // المستوى الحالي لكل صعوبة
+uint8_t winStreakByDifficulty[DIFFICULTY_COUNT]  = {0, 0, 0}; // الانتصارات المتتالية لكل صعوبة
+
+// ------------------- حالات اللعبة -------------------
+enum GameState {
+  STATE_IDLE,               // شاشة البداية بانتظار الضغط على START
+  STATE_SELECT_DIFFICULTY,  // شاشة اختيار الصعوبة
+  STATE_PLAYING,             // اللعب الفعلي (إدخال الرمز)
+  STATE_HINT,                // عرض تلميح النتيجة بعد محاولة خاطئة
+  STATE_WIN,                  // شاشة الفوز
+  STATE_LOSE                  // شاشة الخسارة (انفجار القنبلة)
+};
+
+GameState gameState = STATE_IDLE;
+
+// ------------------- متغيرات اللعبة -------------------
+uint8_t secretCode[CODE_LENGTH];    // الرمز السري الصحيح
+uint8_t currentCode[CODE_LENGTH];   // الرمز الذي يدخله اللاعب حالياً
+uint8_t currentPosition = 0;        // الخانة الحالية المحددة (0 إلى 3)
+uint8_t attemptsLeft = MAX_ATTEMPTS; // عدد المحاولات المتبقية
+
+unsigned long gameStartTime = 0;    // وقت بداية العد التنازلي
+unsigned long remainingTime = GAME_DURATION; // الوقت المتبقي بالميلي ثانية
+
+// نتيجة آخر محاولة (لعرضها في شاشة التلميح)
+uint8_t lastCorrect = 0;
+uint8_t lastWrongPos = 0;
+
+// ------------------- متغيرات البازر أثناء اللعب (بدون delay) -------------------
+unsigned long lastBeepStart = 0;    // وقت بداية آخر بيب
+bool beepActive = false;            // هل البازر يعمل الآن ضمن نبضة البيب
+const unsigned long BEEP_DURATION = 60; // مدة كل بيب 60ms
+
+// ------------------- متغيرات شاشة التلميح -------------------
+unsigned long hintStartTime = 0;
+const unsigned long HINT_DURATION = 2000; // مدة عرض التلميح ثانيتين
+
+// ------------------- متغيرات حالة الخسارة (وميض ونذير) -------------------
+unsigned long lastBlinkTime = 0;
+bool redLedState = false;
+const unsigned long BLINK_INTERVAL = 150;
+
+unsigned long lastAlarmBeep = 0;
+bool alarmBuzzerState = false;
+const unsigned long ALARM_INTERVAL = 100;
+
+// ------------------- متغيرات ضبط تكرار تحديث الشاشة -------------------
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_INTERVAL = 200;
+
+// ------------------- متغيرات مراقبة حركة الجويستيك -------------------
+bool joyYNeutral = true;   // هل عاد المحور Y إلى المنتصف (لمنع التكرار السريع)
+bool joyXNeutral = true;   // هل عاد المحور X إلى المنتصف
+
+// ------------------- متغيرات مراقبة الأزرار (Debounce) -------------------
+unsigned long lastStartDebounce = 0;
+unsigned long lastSwDebounce = 0;
+const unsigned long DEBOUNCE_DELAY = 200;
+
+// ====================================================================
+// setup(): تهيئة المنافذ والشاشة عند تشغيل الأردوينو
+// ====================================================================
+void setup() {
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_JOY_SW, INPUT_PULLUP);
+  pinMode(PIN_START_BTN, INPUT_PULLUP);
+
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  noTone(PIN_BUZZER);
+
+  lcd.init();
+  lcd.backlight();
+
+  // توليد بذرة عشوائية من منفذ تناظري غير مستخدم لضمان أرقام مختلفة كل مرة
+  randomSeed(analogRead(A2));
+
+  showIdleScreen();
+}
+
+// ====================================================================
+// loop(): الحلقة الرئيسية - تدير حالة اللعبة الحالية
+// ====================================================================
+void loop() {
+  switch (gameState) {
+
+    case STATE_IDLE:
+      // بانتظار ضغط زر البداية للانتقال لشاشة اختيار الصعوبة
+      if (isStartButtonPressed()) {
+        enterDifficultySelect();
+      }
+      break;
+
+    case STATE_SELECT_DIFFICULTY:
+      // اختيار الصعوبة بالجويستيك (فوق/تحت) والتأكيد بزر البداية
+      readDifficultySelector();
+      break;
+
+    case STATE_PLAYING:
+      updateTimer();     // تحديث الوقت المتبقي وفحص انتهاء الوقت
+      if (gameState != STATE_PLAYING) break; // قد ينتهي الوقت فينتقل إلى شاشة الخسارة
+
+      playBeepTick();     // تشغيل صوت البيب الدوري أثناء اللعب
+      readJoystick();     // قراءة حركة الجويستيك وتحديث الرمز المدخل
+      if (gameState != STATE_PLAYING) break; // قد تنتقل الحالة بعد تأكيد الرمز (فوز/خسارة/تلميح)
+
+      updatePlayingDisplay(); // تحديث الشاشة بشكل دوري
+      break;
+
+    case STATE_HINT:
+      // عرض نتيجة المحاولة لمدة ثانيتين ثم العودة لشاشة الإدخال
+      if (millis() - hintStartTime >= HINT_DURATION) {
+        gameState = STATE_PLAYING;
+        showPlayingScreenNow();
+      }
+      break;
+
+    case STATE_WIN:
+      // بانتظار ضغط زر البداية لإعادة اللعب بعد الفوز
+      if (isStartButtonPressed()) {
+        resetGame();
+      }
+      break;
+
+    case STATE_LOSE:
+      // وميض LED الأحمر وصوت إنذار مستمر حتى إعادة اللعب
+      playAlarm();
+      if (isStartButtonPressed()) {
+        resetGame();
+      }
+      break;
+  }
+}
+
+// ====================================================================
+// generateCode(): توليد رمز عشوائي مكون من 4 أرقام (0-9)
+// ====================================================================
+void generateCode() {
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    secretCode[i] = random(0, 10); // رقم عشوائي بين 0 و9
+  }
+}
+
+// ====================================================================
+// getLevelDuration(): حساب مدة اللعبة بالميلي ثانية حسب الصعوبة والمستوى
+// ====================================================================
+unsigned long getLevelDuration(uint8_t diff, uint8_t level) {
+  uint8_t idx = (level > 0) ? (level - 1) : 0;
+  if (idx > LEVEL_COUNT - 1) idx = LEVEL_COUNT - 1; // لا يقل الوقت عن آخر قيمة معرّفة
+  return DIFFICULTY_LEVEL_SECONDS[diff][idx] * 1000UL;
+}
+
+// ====================================================================
+// enterDifficultySelect(): الدخول إلى شاشة اختيار الصعوبة
+// ====================================================================
+void enterDifficultySelect() {
+  gameState = STATE_SELECT_DIFFICULTY;
+  joyYNeutral = true;
+  showDifficultyScreen();
+}
+
+// ====================================================================
+// showDifficultyScreen(): عرض شاشة "Select / Difficulty" عند الدخول
+// ====================================================================
+void showDifficultyScreen() {
+  lcd.noBlink();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Select");
+  lcd.setCursor(0, 1);
+  lcd.print("Difficulty");
+}
+
+// ====================================================================
+// updateDifficultyDisplay(): عرض الصعوبة المحددة حالياً (Easy/Normal/Hard)
+// ====================================================================
+void updateDifficultyDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Select");
+  lcd.setCursor(0, 1);
+  lcd.print("> ");
+  lcd.print(DIFFICULTY_NAMES[difficultyIndex]);
+}
+
+// ====================================================================
+// readDifficultySelector(): قراءة الجويستيك لاختيار الصعوبة وتأكيدها
+// ====================================================================
+void readDifficultySelector() {
+  int yValue = analogRead(PIN_JOY_VRY); // فوق / تحت -> تغيير الصعوبة المختارة
+
+  if (joyYNeutral) {
+    if (yValue > JOY_CENTER + JOY_THRESHOLD) {
+      // تحريك العصا للأعلى -> صعوبة أسهل في القائمة
+      if (difficultyIndex > 0) difficultyIndex--;
+      updateDifficultyDisplay();
+      joyYNeutral = false;
+    } else if (yValue < JOY_CENTER - JOY_THRESHOLD) {
+      // تحريك العصا للأسفل -> صعوبة أصعب في القائمة
+      if (difficultyIndex < DIFFICULTY_COUNT - 1) difficultyIndex++;
+      updateDifficultyDisplay();
+      joyYNeutral = false;
+    }
+  } else {
+    // انتظار عودة العصا إلى المنتصف قبل قبول حركة جديدة
+    if (yValue > JOY_CENTER - (JOY_THRESHOLD / 2) &&
+        yValue < JOY_CENTER + (JOY_THRESHOLD / 2)) {
+      joyYNeutral = true;
+    }
+  }
+
+  // زر البداية: تأكيد الصعوبة المختارة وبدء اللعبة
+  if (isStartButtonPressed()) {
+    startGame();
+  }
+}
+
+// ====================================================================
+// startGame(): بدء لعبة جديدة - تهيئة كل متغيرات اللعب
+// ====================================================================
+void startGame() {
+  generateCode();
+
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    currentCode[i] = 0;
+  }
+  currentPosition = 0;
+  attemptsLeft = MAX_ATTEMPTS;
+
+  // مدة اللعبة تُحدَّد حسب الصعوبة والمستوى الحالي لتلك الصعوبة
+  GAME_DURATION = getLevelDuration(difficultyIndex, levelByDifficulty[difficultyIndex]);
+
+  gameStartTime = millis();
+  remainingTime = GAME_DURATION;
+
+  lastBeepStart = millis();
+  beepActive = false;
+
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  noTone(PIN_BUZZER);
+
+  joyXNeutral = true;
+  joyYNeutral = true;
+
+  gameState = STATE_PLAYING;
+  showPlayingScreenNow();
+}
+
+// ====================================================================
+// resetGame(): إعادة اللعبة إلى شاشة البداية
+// ====================================================================
+void resetGame() {
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  noTone(PIN_BUZZER);
+  lcd.noBlink();
+  gameState = STATE_IDLE;
+  showIdleScreen();
+}
+
+// ====================================================================
+// updateTimer(): تحديث الوقت المتبقي وفحص انتهاء الوقت (بدون delay)
+// ====================================================================
+void updateTimer() {
+  unsigned long elapsed = millis() - gameStartTime;
+
+  if (elapsed >= GAME_DURATION) {
+    remainingTime = 0;
+    triggerLose(); // انتهى الوقت -> انفجار القنبلة
+  } else {
+    remainingTime = GAME_DURATION - elapsed;
+  }
+}
+
+// ====================================================================
+// playBeepTick(): إصدار صوت بيب دوري حسب الوقت المتبقي (بدون delay)
+// ====================================================================
+void playBeepTick() {
+  unsigned long secondsLeft = remainingTime / 1000UL;
+  unsigned long beepInterval;
+
+  // تحديد الفاصل الزمني بين كل بيب حسب الوقت المتبقي
+  if (secondsLeft > 10) {
+    beepInterval = 1000; // أكبر من 10 ثوان -> بيب كل ثانية
+  } else if (secondsLeft > 5) {
+    beepInterval = 500;  // بين 6 و10 ثوان -> بيب كل نصف ثانية
+  } else {
+    beepInterval = 200;  // 5 ثوان أو أقل -> بيب سريع
+  }
+
+  unsigned long now = millis();
+
+  if (!beepActive) {
+    // حان وقت بدء بيب جديد
+    if (now - lastBeepStart >= beepInterval) {
+      tone(PIN_BUZZER, BUZZER_FREQ); // تشغيل نغمة بتردد ثابت وواضح
+      beepActive = true;
+      lastBeepStart = now;
+    }
+  } else {
+    // إيقاف البيب بعد انتهاء مدته (60ms)
+    if (now - lastBeepStart >= BEEP_DURATION) {
+      noTone(PIN_BUZZER);
+      beepActive = false;
+      lastBeepStart = now;
+    }
+  }
+}
+
+// ====================================================================
+// readJoystick(): قراءة حركة الجويستيك وتحديث الرمز المدخل والخانة
+// ====================================================================
+void readJoystick() {
+  int yValue = analogRead(PIN_JOY_VRY); // فوق / تحت -> تغيير قيمة الرقم
+  int xValue = analogRead(PIN_JOY_VRX); // يمين / يسار -> تغيير الخانة
+
+  // ----- التحكم بقيمة الرقم الحالي (فوق يزيد / تحت ينقص) -----
+  if (joyYNeutral) {
+    if (yValue > JOY_CENTER + JOY_THRESHOLD) {
+      // تحريك العصا للأعلى -> زيادة الرقم
+      currentCode[currentPosition] = (currentCode[currentPosition] + 1) % 10;
+      joyYNeutral = false;
+    } else if (yValue < JOY_CENTER - JOY_THRESHOLD) {
+      // تحريك العصا للأسفل -> إنقاص الرقم
+      currentCode[currentPosition] = (currentCode[currentPosition] + 9) % 10;
+      joyYNeutral = false;
+    }
+  } else {
+    // انتظار عودة العصا إلى المنتصف قبل قبول حركة جديدة
+    if (yValue > JOY_CENTER - (JOY_THRESHOLD / 2) &&
+        yValue < JOY_CENTER + (JOY_THRESHOLD / 2)) {
+      joyYNeutral = true;
+    }
+  }
+
+  // ----- التحكم بالانتقال بين الخانات (يمين / يسار) -----
+  if (joyXNeutral) {
+    if (xValue > JOY_CENTER + JOY_THRESHOLD) {
+      // تحريك العصا لليمين -> الانتقال للخانة التالية
+      if (currentPosition < CODE_LENGTH - 1) currentPosition++;
+      joyXNeutral = false;
+    } else if (xValue < JOY_CENTER - JOY_THRESHOLD) {
+      // تحريك العصا لليسار -> الانتقال للخانة السابقة
+      if (currentPosition > 0) currentPosition--;
+      joyXNeutral = false;
+    }
+  } else {
+    if (xValue > JOY_CENTER - (JOY_THRESHOLD / 2) &&
+        xValue < JOY_CENTER + (JOY_THRESHOLD / 2)) {
+      joyXNeutral = true;
+    }
+  }
+
+  // ----- زر الجويستيك: تأكيد الرمز بالكامل -----
+  if (digitalRead(PIN_JOY_SW) == LOW) {
+    if (millis() - lastSwDebounce > DEBOUNCE_DELAY) {
+      lastSwDebounce = millis();
+      checkCode();
+    }
+  }
+}
+
+// ====================================================================
+// checkCode(): مقارنة الرمز المدخل بالرمز الصحيح وتحديث نتيجة المحاولة
+// ====================================================================
+void checkCode() {
+  uint8_t correct = 0;
+  uint8_t wrongPos = 0;
+
+  bool secretMatched[CODE_LENGTH];
+  bool guessMatched[CODE_LENGTH];
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    secretMatched[i] = false;
+    guessMatched[i] = false;
+  }
+
+  // ----- الخطوة 1: حساب الأرقام الصحيحة في أماكنها الصحيحة -----
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    if (currentCode[i] == secretCode[i]) {
+      correct++;
+      secretMatched[i] = true;
+      guessMatched[i] = true;
+    }
+  }
+
+  // إذا كان الرمز صحيحاً بالكامل -> فوز فوري
+  if (correct == CODE_LENGTH) {
+    triggerWin();
+    return;
+  }
+
+  // ----- الخطوة 2: حساب الأرقام الصحيحة ولكن في مكان خاطئ -----
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    if (guessMatched[i]) continue; // تم احتسابه مسبقاً كمطابقة تامة
+    for (uint8_t j = 0; j < CODE_LENGTH; j++) {
+      if (!secretMatched[j] && !guessMatched[i] && currentCode[i] == secretCode[j]) {
+        wrongPos++;
+        secretMatched[j] = true;
+        break;
+      }
+    }
+  }
+
+  lastCorrect = correct;
+  lastWrongPos = wrongPos;
+
+  // إنقاص عدد المحاولات المتبقية
+  if (attemptsLeft > 0) attemptsLeft--;
+
+  if (attemptsLeft == 0) {
+    triggerLose(); // انتهت المحاولات -> انفجار القنبلة
+  } else {
+    displayHint(lastCorrect, lastWrongPos); // عرض تلميح النتيجة
+  }
+}
+
+// ====================================================================
+// displayHint(): عرض عدد الأرقام الصحيحة والأرقام في مكان خاطئ لثانيتين
+// ====================================================================
+void displayHint(uint8_t correct, uint8_t wrongPos) {
+  lcd.noBlink();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Correct:");
+  lcd.print(correct);
+  lcd.setCursor(0, 1);
+  lcd.print("WrongPos:");
+  lcd.print(wrongPos);
+
+  hintStartTime = millis();
+  gameState = STATE_HINT; // الانتظار غير المحجوب (بدون delay) في loop()
+}
+
+// ====================================================================
+// registerWinAndCheckLevelUp(): تحديث عداد الانتصارات المتتالية ورفع
+// المستوى تلقائياً كل 5 انتصارات متتالية لنفس الصعوبة
+// ====================================================================
+bool registerWinAndCheckLevelUp() {
+  winStreakByDifficulty[difficultyIndex]++;
+  if (winStreakByDifficulty[difficultyIndex] >= WINS_TO_LEVEL_UP) {
+    levelByDifficulty[difficultyIndex]++;
+    winStreakByDifficulty[difficultyIndex] = 0;
+    return true; // ارتفع المستوى
+  }
+  return false;
+}
+
+// ====================================================================
+// triggerWin(): تشغيل حالة الفوز - LED أخضر ولحن فوز وشاشة نجاح
+// ====================================================================
+void triggerWin() {
+  bool leveledUp = registerWinAndCheckLevelUp();
+
+  gameState = STATE_WIN;
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, HIGH);
+  lcd.noBlink();
+
+  if (leveledUp) {
+    // شاشة فوز/خسارة فقط: delay() مسموح هنا حسب متطلبات المشروع
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("LEVEL UP!");
+    delay(2000);
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Bomb Defused!");
+  lcd.setCursor(0, 1);
+  lcd.print("You Win!");
+
+  playWinMelody();
+}
+
+// ====================================================================
+// triggerLose(): تشغيل حالة الخسارة - عرض BOOM والرمز الصحيح
+// ====================================================================
+void triggerLose() {
+  winStreakByDifficulty[difficultyIndex] = 0; // الخسارة تكسر تسلسل الانتصارات المتتالية
+
+  gameState = STATE_LOSE;
+  digitalWrite(PIN_LED_GREEN, LOW);
+  noTone(PIN_BUZZER);
+  lcd.noBlink();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("BOOM!!");
+  lcd.setCursor(0, 1);
+  lcd.print("Code: ");
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    lcd.print(secretCode[i]);
+  }
+
+  redLedState = false;
+  lastBlinkTime = millis();
+  alarmBuzzerState = false;
+  lastAlarmBeep = millis();
+}
+
+// ====================================================================
+// playAlarm(): وميض LED الأحمر وصوت الإنذار السريع (بدون delay)
+// ====================================================================
+void playAlarm() {
+  unsigned long now = millis();
+
+  // وميض LED الأحمر
+  if (now - lastBlinkTime >= BLINK_INTERVAL) {
+    redLedState = !redLedState;
+    digitalWrite(PIN_LED_RED, redLedState ? HIGH : LOW);
+    lastBlinkTime = now;
+  }
+
+  // صوت إنذار سريع من البازر
+  if (now - lastAlarmBeep >= ALARM_INTERVAL) {
+    alarmBuzzerState = !alarmBuzzerState;
+    if (alarmBuzzerState) {
+      tone(PIN_BUZZER, BUZZER_FREQ);
+    } else {
+      noTone(PIN_BUZZER);
+    }
+    lastAlarmBeep = now;
+  }
+}
+
+// ====================================================================
+// playWinMelody(): تشغيل لحن فوز بسيط باستخدام البازر النشط (بدون delay)
+// ====================================================================
+void playWinMelody() {
+  // البازر Active Buzzer لا يمكنه إصدار ترددات مختلفة، لذا نستخدم
+  // نبضات (تشغيل/إيقاف) متتالية بأطوال مختلفة لتكوين لحن بسيط.
+  const unsigned long notes[] = {120, 120, 120, 250};
+  const unsigned long gaps[]  = {80, 80, 80, 0};
+  const uint8_t noteCount = 4;
+
+  for (uint8_t i = 0; i < noteCount; i++) {
+    unsigned long noteStart = millis();
+    tone(PIN_BUZZER, BUZZER_FREQ);
+    while (millis() - noteStart < notes[i]) {
+      // انتظار غير مبني على delay() بل على مقارنة millis()
+    }
+    noTone(PIN_BUZZER);
+
+    unsigned long gapStart = millis();
+    while (millis() - gapStart < gaps[i]) {
+      // فاصل صمت قصير بين النغمات
+    }
+  }
+}
+
+// ====================================================================
+// showIdleScreen(): عرض شاشة البداية "DEFUSE BOMB / Press START"
+// ====================================================================
+void showIdleScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DEFUSE BOMB");
+  lcd.setCursor(0, 1);
+  lcd.print("Press START");
+}
+
+// ====================================================================
+// showPlayingScreenNow(): إعادة رسم شاشة اللعب فوراً (بدون انتظار)
+// ====================================================================
+void showPlayingScreenNow() {
+  lastDisplayUpdate = 0; // إجبار التحديث الفوري في updatePlayingDisplay()
+  updatePlayingDisplay();
+}
+
+// ====================================================================
+// updatePlayingDisplay(): تحديث شاشة اللعب (الوقت، المحاولات، الرمز)
+// ====================================================================
+void updatePlayingDisplay() {
+  unsigned long now = millis();
+  if (now - lastDisplayUpdate < DISPLAY_INTERVAL) return; // تقليل تحديث الشاشة
+  lastDisplayUpdate = now;
+
+  unsigned long secondsLeft = remainingTime / 1000UL;
+
+  // ----- السطر الأول: المستوى، الوقت المتبقي، وعدد المحاولات -----
+  lcd.setCursor(0, 0);
+  lcd.print("                "); // مسح السطر بالكامل (طول المحتوى متغير)
+  lcd.setCursor(0, 0);
+  lcd.print("L");
+  lcd.print(levelByDifficulty[difficultyIndex]);
+  lcd.print(" T:");
+  lcd.print(secondsLeft);
+  lcd.print(" Try:");
+  lcd.print(attemptsLeft);
+
+  // ----- السطر الثاني: الرمز الذي يدخله اللاعب -----
+  lcd.setCursor(0, 1);
+  for (uint8_t i = 0; i < CODE_LENGTH; i++) {
+    lcd.print(currentCode[i]);
+    lcd.print(" ");
+  }
+  lcd.print("        "); // مسح بقية السطر
+
+  // عرض مؤشر وامض تحت الخانة المحددة حالياً
+  lcd.setCursor(currentPosition * 2, 1);
+  lcd.blink();
+}
+
+// ====================================================================
+// isStartButtonPressed(): فحص ضغط زر البداية مع منع الارتداد (Debounce)
+// ====================================================================
+bool isStartButtonPressed() {
+  if (digitalRead(PIN_START_BTN) == LOW) {
+    if (millis() - lastStartDebounce > DEBOUNCE_DELAY) {
+      lastStartDebounce = millis();
+      return true;
+    }
+  }
+  return false;
+}
